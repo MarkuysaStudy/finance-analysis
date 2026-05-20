@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
+
 """
-Sample: 2015-01-01 to 2025-12-31 (month-end), with out-of-sample (OOS) evaluation from 2021-02 to 2025-12.
 
 Tables (CSV, saved to <outdir>/tables/)
 - monthly_returns.csv                          : monthly returns for all ETFs
@@ -29,7 +28,6 @@ Figures (PNG, saved to <outdir>/figures/)
 - 06_sector_selection_frequency.png
 
 """
-
 from __future__ import annotations
 
 import argparse
@@ -49,6 +47,7 @@ from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.base import clone
 
 warnings.filterwarnings("ignore")
 
@@ -58,12 +57,16 @@ except ImportError as e:
     raise SystemExit("Please install yfinance (see requirements file).") from e
 
 
+
+
+
+
 DEFAULT_START_DATE = "2015-01-01"
 DEFAULT_END_DATE = "2025-12-31"
-DEFAULT_TRAIN_YEARS = 5          # 5 years => 60 months initial training horizon
-DEFAULT_TOP_K = 3                # Top-3 selection rule
-DEFAULT_RF_ANNUAL = 0.02         # annual risk-free rate for Sharpe/Sortino
-DEFAULT_TCOST_BPS = 10.0         # baseline turnover cost in bps; use --tcost-bps 50 for the stress scenario
+DEFAULT_TRAIN_YEARS = 5
+DEFAULT_TOP_K = 3
+DEFAULT_RF_ANNUAL = 0.02
+DEFAULT_TCOST_BPS = 10.0
 
 TICKERS: Dict[str, str] = {
     "XLB": "Materials",
@@ -78,6 +81,11 @@ TICKERS: Dict[str, str] = {
     "SPY": "S&P 500 (benchmark)",
 }
 
+
+
+
+
+
 def ensure_dirs(outdir: Path) -> Tuple[Path, Path]:
     outdir.mkdir(parents=True, exist_ok=True)
     figdir = outdir / "figures"
@@ -88,18 +96,28 @@ def ensure_dirs(outdir: Path) -> Tuple[Path, Path]:
 
 
 def pct(x: float) -> float:
+    """Convert fraction to percent."""
     return 100.0 * x
+
+
+
+
+
 
 def download_monthly_prices(
     tickers: List[str],
     start: str,
     end: str,
 ) -> pd.DataFrame:
+    """
+    Download adjusted price series (auto_adjust=True) and resample to month-end.
+    """
     raw = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)
     if isinstance(raw.columns, pd.MultiIndex):
         prices = raw["Close"].copy()
     else:
         prices = raw[["Close"]].rename(columns={"Close": tickers[0]})
+
 
     prices = prices.resample("M").last().dropna(how="all")
     prices = prices.dropna(axis=1, how="all")
@@ -107,12 +125,15 @@ def download_monthly_prices(
 
 
 def monthly_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """
+    Simple monthly returns computed from month-end prices.
+    """
     return prices.pct_change().dropna()
 
 
-# ----------------------------
-# FEATURE ENGINEERING
-# ----------------------------
+
+
+
 
 def make_asset_features(returns: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     """
@@ -142,42 +163,46 @@ def make_asset_features(returns: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         r = returns[ticker]
         df = pd.DataFrame(index=returns.index)
 
-        # Lagged returns (simple sums; consistent with the formulas in the report)
+
         df["ret1m"] = r.shift(1)
         df["ret3m"] = r.rolling(3).sum().shift(1)
         df["ret6m"] = r.rolling(6).sum().shift(1)
         df["ret12m"] = r.rolling(12).sum().shift(1)
 
-        # Rolling volatility
+
         df["vol3m"] = r.rolling(3).std().shift(1)
         df["vol6m"] = r.rolling(6).std().shift(1)
         df["vol12m"] = r.rolling(12).std().shift(1)
 
-        # Market features (SPY)
+
         df["mkt_ret1m"] = market.shift(1)
         df["mkt_ret3m"] = market.rolling(3).sum().shift(1)
         df["mkt_vol6m"] = market.rolling(6).std().shift(1)
 
-        # Relative strength
+
         df["rel_strength3m"] = df["ret3m"] - df["mkt_ret3m"]
 
-        # Rolling beta and correlation vs market
+
         df["beta12m"] = r.rolling(12).cov(market).shift(1) / market.rolling(12).var().shift(1)
         df["corr12m"] = r.rolling(12).corr(market).shift(1)
 
-        # Rolling drawdown proxy
+
         wealth = (1.0 + r.fillna(0.0)).cumprod()
         peak = wealth.cummax()
         drawdown = wealth / peak - 1.0
         df["drawdown6m"] = drawdown.rolling(6).min().shift(1)
 
-        # Target (non-lagged): next-month return at time t
+
         df["target"] = r
 
-        # Drop NA rows introduced by rolling windows and lagging
+
         features[ticker] = df.dropna()
 
     return features
+
+
+
+
 
 
 def build_models() -> Dict[str, object]:
@@ -218,16 +243,18 @@ class ForecastResult:
     forecasts: pd.DataFrame
     metrics: pd.DataFrame
     dm_tests: pd.DataFrame
+    cw_tests: pd.DataFrame
     feature_importance: pd.DataFrame
 
 
 def _norm_cdf(x: float) -> float:
+    """Normal CDF without scipy."""
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
 def diebold_mariano_test(loss_diff: np.ndarray) -> Tuple[float, float]:
     """
-    Diebold–Mariano test for equal predictive accuracy (h=1).
+    Diebold-Mariano test for equal predictive accuracy (h=1).
     loss_diff: series d_t = L1_t - L0_t, e.g., squared error differential.
 
     Returns: (DM statistic, two-sided p-value with normal approximation).
@@ -248,14 +275,54 @@ def diebold_mariano_test(loss_diff: np.ndarray) -> Tuple[float, float]:
     return dm, p
 
 
-def rolling_forecasts(features: Dict[str, pd.DataFrame], train_years: int) -> ForecastResult:
+def clark_west_test(actual: np.ndarray, benchmark_forecast: np.ndarray, alternative_forecast: np.ndarray) -> Tuple[float, float]:
     """
-    Expanding-window OOS forecasts.
+    Clark-West-style adjusted test for nested forecast comparison.
+
+    The test is used here as a diagnostic comparing an alternative forecast with the
+    Historical Mean benchmark. A positive statistic indicates that the alternative
+    forecast improves adjusted MSPE relative to the benchmark. The p-value is a
+    one-sided normal-approximation p-value.
+    """
+    y = np.asarray(actual, dtype=float)
+    f0 = np.asarray(benchmark_forecast, dtype=float)
+    f1 = np.asarray(alternative_forecast, dtype=float)
+    mask = np.isfinite(y) & np.isfinite(f0) & np.isfinite(f1)
+    y, f0, f1 = y[mask], f0[mask], f1[mask]
+    n = len(y)
+    if n < 10:
+        return np.nan, np.nan
+
+    e0 = y - f0
+    e1 = y - f1
+    adjusted = e0 ** 2 - (e1 ** 2 - (f0 - f1) ** 2)
+    var_adj = adjusted.var(ddof=1)
+    if var_adj <= 0:
+        return np.nan, np.nan
+    stat = adjusted.mean() / math.sqrt(var_adj / n)
+    p_one_sided = 1.0 - _norm_cdf(stat)
+    return stat, p_one_sided
+
+
+def rolling_forecasts(
+    features: Dict[str, pd.DataFrame],
+    train_years: int,
+    window: str = "expanding",
+    rolling_months: int = 36,
+) -> ForecastResult:
+    """
+    Expanding-window or rolling-window OOS forecasts.
 
     Training begins after train_years*12 observations inside each asset's feature panel.
+    With window='rolling', each model is estimated using the latest rolling_months
+    observations available before the forecast date.
     """
     models = build_models()
     train_months = train_years * 12
+    if window not in {"expanding", "rolling"}:
+        raise ValueError("window must be either 'expanding' or 'rolling'")
+    if rolling_months < 12:
+        raise ValueError("rolling_months must be at least 12")
 
     rows = []
     fi_rows = []
@@ -264,28 +331,31 @@ def rolling_forecasts(features: Dict[str, pd.DataFrame], train_years: int) -> Fo
         X = df.drop(columns=["target"])
         y = df["target"]
 
-        # start after sufficient training history
         start_idx = train_months
         for i in range(start_idx, len(df)):
-            train_X = X.iloc[:i]
-            train_y = y.iloc[:i]
+            if window == "rolling":
+                train_start = max(0, i - rolling_months)
+                train_X = X.iloc[train_start:i]
+                train_y = y.iloc[train_start:i]
+            else:
+                train_X = X.iloc[:i]
+                train_y = y.iloc[:i]
+
             test_X = X.iloc[[i]]
             test_y = float(y.iloc[i])
             dt = df.index[i]
 
-            # Benchmark: historical mean
             hist_mean = float(train_y.mean())
             rows.append({"date": dt, "ticker": ticker, "model": "HistMean", "actual": test_y, "forecast": hist_mean})
 
             for name, model in models.items():
                 if name == "HistMean":
                     continue
-                mdl = model
+                mdl = clone(model)
                 mdl.fit(train_X, train_y)
                 pred = float(mdl.predict(test_X)[0])
                 rows.append({"date": dt, "ticker": ticker, "model": name, "actual": test_y, "forecast": pred})
 
-                # Store feature importance snapshots (December only) for tree models
                 if dt.month == 12 and hasattr(mdl, "feature_importances_"):
                     for col, val in zip(train_X.columns, getattr(mdl, "feature_importances_")):
                         fi_rows.append({
@@ -299,7 +369,6 @@ def rolling_forecasts(features: Dict[str, pd.DataFrame], train_years: int) -> Fo
     forecasts = pd.DataFrame(rows).sort_values(["date", "ticker", "model"]).reset_index(drop=True)
     feature_importance = pd.DataFrame(fi_rows)
 
-    # Forecast evaluation metrics (pooled across tickers and dates)
     metric_rows = []
     for model, g in forecasts.groupby("model"):
         rmse = math.sqrt(mean_squared_error(g["actual"], g["forecast"]))
@@ -309,20 +378,44 @@ def rolling_forecasts(features: Dict[str, pd.DataFrame], train_years: int) -> Fo
         metric_rows.append({"model": model, "RMSE": rmse, "MAE": mae, "DirectionalAccuracy": direction, "ForecastCorrelation": corr})
     metrics = pd.DataFrame(metric_rows).sort_values("RMSE").reset_index(drop=True)
 
-    # Diebold–Mariano tests vs HistMean (squared error differential)
-    dm_rows = []
     base = forecasts[forecasts["model"] == "HistMean"].copy()
     base["se_base"] = (base["actual"] - base["forecast"]) ** 2
+
+    dm_rows = []
+    cw_rows = []
     for model in [m for m in forecasts["model"].unique() if m != "HistMean"]:
         alt = forecasts[forecasts["model"] == model].copy()
         alt["se_alt"] = (alt["actual"] - alt["forecast"]) ** 2
-        merged = base.merge(alt[["date", "ticker", "se_alt"]], on=["date", "ticker"], how="inner")
+        merged = base.merge(
+            alt[["date", "ticker", "forecast", "se_alt"]].rename(columns={"forecast": "forecast_alt"}),
+            on=["date", "ticker"],
+            how="inner",
+        )
         d = (merged["se_alt"] - merged["se_base"]).to_numpy()
         dm, p = diebold_mariano_test(d)
         dm_rows.append({"model": model, "DM_stat": dm, "p_value": p, "n_obs": int(len(d))})
-    dm_tests = pd.DataFrame(dm_rows).sort_values("p_value").reset_index(drop=True)
 
-    return ForecastResult(forecasts=forecasts, metrics=metrics, dm_tests=dm_tests, feature_importance=feature_importance)
+        cw_stat, cw_p = clark_west_test(
+            merged["actual"].to_numpy(),
+            merged["forecast"].to_numpy(),
+            merged["forecast_alt"].to_numpy(),
+        )
+        cw_rows.append({"model": model, "CW_stat": cw_stat, "p_value_one_sided": cw_p, "n_obs": int(len(merged))})
+
+    dm_tests = pd.DataFrame(dm_rows).sort_values("p_value").reset_index(drop=True)
+    cw_tests = pd.DataFrame(cw_rows).sort_values("p_value_one_sided").reset_index(drop=True)
+
+    return ForecastResult(
+        forecasts=forecasts,
+        metrics=metrics,
+        dm_tests=dm_tests,
+        cw_tests=cw_tests,
+        feature_importance=feature_importance,
+    )
+
+
+
+
 
 
 def _equal_weight_topk(chosen: List[str]) -> Dict[str, float]:
@@ -345,6 +438,40 @@ def _inverse_vol_weights(chosen: List[str], vol_series: pd.Series) -> Dict[str, 
     return inv.to_dict()
 
 
+
+def _risk_parity_weights(chosen: List[str], cov: pd.DataFrame) -> Dict[str, float]:
+    """
+    Approximate long-only equal-risk-contribution weights for the selected assets.
+    Falls back to inverse-volatility weights if the covariance matrix is not usable.
+    """
+    if not chosen:
+        return {}
+    cov = cov.reindex(index=chosen, columns=chosen).replace([np.inf, -np.inf], np.nan)
+    if cov.isna().any().any() or cov.shape[0] == 0:
+        vol = pd.Series(np.sqrt(np.diag(cov.fillna(0.0))), index=chosen).replace(0, np.nan)
+        return _inverse_vol_weights(chosen, vol)
+
+    sigma = cov.to_numpy(dtype=float)
+    n = len(chosen)
+
+    sigma = sigma + np.eye(n) * 1e-10
+    w = np.repeat(1.0 / n, n)
+    target = 1.0 / n
+
+    for _ in range(500):
+        port_var = float(w @ sigma @ w)
+        if port_var <= 0 or not np.isfinite(port_var):
+            return _equal_weight_topk(chosen)
+        mrc = sigma @ w
+        rc = w * mrc / port_var
+        rc = np.clip(rc, 1e-8, None)
+        w = w * (target / rc) ** 0.5
+        w = np.clip(w, 1e-8, None)
+        w = w / w.sum()
+
+    return {t: float(wi) for t, wi in zip(chosen, w)}
+
+
 def compute_turnover(weights: pd.DataFrame) -> pd.Series:
     """
     Monthly turnover defined as 0.5 * sum(|w_t - w_{t-1}|).
@@ -365,41 +492,39 @@ def build_portfolios(
     Build model-based and benchmark portfolios and return:
     - portfolios: long format with monthly strategy returns
     - weights: wide format with strategy weights (for turnover)
+
+    Supported weighting rules:
+    - equal: equal weights inside the selected Top-K set;
+    - invvol: inverse trailing-volatility weights;
+    - riskparity: approximate equal-risk-contribution weights using trailing covariance.
     """
+    if weighting not in {"equal", "invvol", "riskparity"}:
+        raise ValueError("weighting must be one of: equal, invvol, riskparity")
+
     asset_universe = [c for c in returns.columns if c != "SPY"]
     test_dates = sorted(set(forecasts["date"]))
 
-    # benchmark series
     eq_rets = returns.loc[test_dates, asset_universe].mean(axis=1)
     spy_rets = returns.loc[test_dates, "SPY"]
-
-    # momentum benchmark: trailing 12m sum (shifted)
     mom_signal = returns[asset_universe].rolling(12).sum().shift(1)
 
-    # container for returns
     port_rows = []
-    # container for weights
     weight_rows = []
 
-    # Equal-weight sectors benchmark
     for dt in test_dates:
         port_rows.append({"date": dt, "strategy": "EqualWeight", "return": float(eq_rets.loc[dt])})
-    # SPY benchmark
-    for dt in test_dates:
         port_rows.append({"date": dt, "strategy": "SPY", "return": float(spy_rets.loc[dt])})
 
-    # Momentum Top-K
     for dt in test_dates:
         ranked = mom_signal.loc[dt].dropna().sort_values(ascending=False).head(top_k)
         chosen = ranked.index.tolist()
         w = _equal_weight_topk(chosen)
-        realized = float(returns.loc[dt, chosen].mean())
+        realized = float((returns.loc[dt, list(w.keys())] * pd.Series(w)).sum()) if w else np.nan
         port_rows.append({"date": dt, "strategy": f"MomentumTop{top_k}", "return": realized})
         row = {"date": dt, "strategy": f"MomentumTop{top_k}"}
         row.update({t: w.get(t, 0.0) for t in asset_universe})
         weight_rows.append(row)
 
-    # Model-based Top-K
     for model in sorted(forecasts["model"].unique()):
         for dt in test_dates:
             g = forecasts[(forecasts["date"] == dt) & (forecasts["model"] == model) & (forecasts["ticker"].isin(asset_universe))]
@@ -407,14 +532,16 @@ def build_portfolios(
             chosen = ranked["ticker"].tolist()
 
             if weighting == "invvol":
-                # use trailing 6m volatility (shifted) as a weight proxy
                 vol6 = returns[asset_universe].rolling(6).std().shift(1).loc[dt]
                 w = _inverse_vol_weights(chosen, vol6)
-                realized = float((returns.loc[dt, list(w.keys())] * pd.Series(w)).sum())
+            elif weighting == "riskparity":
+                hist = returns.loc[:dt, asset_universe].iloc[:-1].tail(12)
+                cov = hist.cov()
+                w = _risk_parity_weights(chosen, cov)
             else:
                 w = _equal_weight_topk(chosen)
-                realized = float(returns.loc[dt, chosen].mean())
 
+            realized = float((returns.loc[dt, list(w.keys())] * pd.Series(w)).sum()) if w else np.nan
             port_rows.append({"date": dt, "strategy": model, "return": realized})
 
             row = {"date": dt, "strategy": model}
@@ -425,6 +552,10 @@ def build_portfolios(
     weights = pd.DataFrame(weight_rows).sort_values(["date", "strategy"]).reset_index(drop=True)
 
     return portfolios, weights
+
+
+
+
 
 
 def performance_table(portfolios: pd.DataFrame, rf_annual: float) -> pd.DataFrame:
@@ -512,6 +643,11 @@ def year_end_selections(forecasts: pd.DataFrame, top_k: int) -> pd.DataFrame:
         out.append({"Year": int(year), "Model": model, f"Top{top_k}": ", ".join(top)})
     return pd.DataFrame(out).sort_values(["Year", "Model"]).reset_index(drop=True)
 
+
+
+
+
+
 def descriptive_statistics(data: pd.DataFrame, rf_annual: float) -> pd.DataFrame:
     """
     Descriptive statistics for each numeric column.
@@ -543,6 +679,90 @@ def descriptive_statistics(data: pd.DataFrame, rf_annual: float) -> pd.DataFrame
         })
 
     return pd.DataFrame(rows)
+
+
+
+def _annualized_sharpe(monthly_returns: np.ndarray, rf_annual: float) -> float:
+    s = np.asarray(monthly_returns, dtype=float)
+    s = s[np.isfinite(s)]
+    if len(s) < 3:
+        return np.nan
+    rf_monthly = (1.0 + rf_annual) ** (1.0 / 12.0) - 1.0
+    ann_mean = s.mean() * 12.0
+    ann_vol = s.std(ddof=1) * math.sqrt(12.0)
+    if ann_vol <= 0:
+        return np.nan
+    return float((ann_mean - rf_annual) / ann_vol)
+
+
+def block_bootstrap_portfolio_tests(
+    portfolios: pd.DataFrame,
+    comparisons: List[Tuple[str, str]],
+    rf_annual: float,
+    n_boot: int = 2000,
+    block_size: int = 6,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """
+    Block bootstrap diagnostics for Sharpe-ratio and median-return differences.
+    Returns two-sided empirical p-values for the null of zero difference.
+    """
+    rng = np.random.default_rng(seed)
+    wide = portfolios.pivot(index="date", columns="strategy", values="return").sort_index()
+    n = len(wide)
+    rows = []
+    if n == 0:
+        return pd.DataFrame()
+
+    for left, right in comparisons:
+        if left not in wide.columns or right not in wide.columns:
+            continue
+        pair = wide[[left, right]].dropna()
+        if len(pair) < block_size + 1:
+            continue
+        x = pair[left].to_numpy(dtype=float)
+        y = pair[right].to_numpy(dtype=float)
+        obs_sharpe_diff = _annualized_sharpe(x, rf_annual) - _annualized_sharpe(y, rf_annual)
+        obs_median_diff = float(np.median(x) - np.median(y))
+
+        boot_sharpe = []
+        boot_median = []
+        m = len(pair)
+        starts = np.arange(0, m)
+        for _ in range(n_boot):
+            idx = []
+            while len(idx) < m:
+                st = int(rng.choice(starts))
+                idx.extend([(st + j) % m for j in range(block_size)])
+            idx = np.array(idx[:m])
+            xb = x[idx]
+            yb = y[idx]
+            boot_sharpe.append(_annualized_sharpe(xb, rf_annual) - _annualized_sharpe(yb, rf_annual))
+            boot_median.append(float(np.median(xb) - np.median(yb)))
+
+        boot_sharpe = np.asarray(boot_sharpe, dtype=float)
+        boot_median = np.asarray(boot_median, dtype=float)
+
+        sharpe_centered = boot_sharpe - np.nanmean(boot_sharpe)
+        median_centered = boot_median - np.nanmean(boot_median)
+        p_sharpe = float(np.nanmean(np.abs(sharpe_centered) >= abs(obs_sharpe_diff)))
+        p_median = float(np.nanmean(np.abs(median_centered) >= abs(obs_median_diff)))
+
+        rows.append({
+            "comparison": f"{left} vs {right}",
+            "sharpe_diff": obs_sharpe_diff,
+            "bootstrap_p_value_sharpe": p_sharpe,
+            "median_return_diff": obs_median_diff,
+            "bootstrap_p_value_median": p_median,
+            "n_months": int(m),
+            "block_size": int(block_size),
+        })
+
+    return pd.DataFrame(rows)
+
+
+
+
 
 
 def plot_correlation_heatmap(returns: pd.DataFrame, outfile: Path) -> None:
@@ -662,6 +882,10 @@ def plot_selection_frequency(selection: pd.DataFrame, outfile: Path) -> None:
     plt.close(fig)
 
 
+
+
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Reproduce the empirical analysis for the term paper.")
     p.add_argument("--start", default=DEFAULT_START_DATE, help="Start date (YYYY-MM-DD).")
@@ -670,8 +894,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--top-k", type=int, default=DEFAULT_TOP_K, help="Top-K sectors selected each month.")
     p.add_argument("--rf", type=float, default=DEFAULT_RF_ANNUAL, help="Annual risk-free rate (for Sharpe/Sortino).")
     p.add_argument("--tcost-bps", type=float, default=DEFAULT_TCOST_BPS, help="Turnover cost (bps) applied to turnover share.")
-    p.add_argument("--weighting", choices=["equal", "invvol"], default="equal", help="Weighting rule inside Top-K.")
-    p.add_argument("--outdir", default="outputs", help="Output directory.")
+    p.add_argument("--weighting", choices=["equal", "invvol", "riskparity"], default="equal", help="Weighting rule inside Top-K.")
+    p.add_argument("--window", choices=["expanding", "rolling"], default="expanding", help="Training window design for OOS forecasts.")
+    p.add_argument("--rolling-months", type=int, default=36, help="Rolling training-window length in months when --window rolling is used.")
+    p.add_argument("--outdir", default="ml_asset_management_outputs", help="Output directory.")
     return p.parse_args()
 
 
@@ -680,23 +906,23 @@ def main() -> None:
     outdir = Path(args.outdir)
     figdir, tabdir = ensure_dirs(outdir)
 
-    # 1) Data
+
     print("Downloading data (yfinance)...")
     prices = download_monthly_prices(list(TICKERS.keys()), args.start, args.end)
     rets = monthly_returns(prices)
 
-    # 2) Features and forecasts
+
     print("Engineering features...")
     features = make_asset_features(rets)
 
     print("Running expanding-window forecasts...")
-    fr = rolling_forecasts(features, train_years=args.train_years)
+    fr = rolling_forecasts(features, train_years=args.train_years, window=args.window, rolling_months=args.rolling_months)
 
-    # 3) Portfolios
+
     print("Constructing portfolios...")
     portfolios_gross, weights = build_portfolios(fr.forecasts, rets, top_k=args.top_k, weighting=args.weighting)
 
-    # Turnover for active strategies (exclude SPY, EqualWeight)
+
     asset_cols = [c for c in rets.columns if c != "SPY"]
     turnover_rows = []
     for strat, g in weights.groupby("strategy"):
@@ -705,7 +931,7 @@ def main() -> None:
         turnover_rows.append({"Strategy": strat, "AverageMonthlyTurnover": float(turn.mean())})
     turnover = pd.DataFrame(turnover_rows).sort_values("AverageMonthlyTurnover", ascending=False).reset_index(drop=True)
 
-    # Net-of-turnover-cost returns
+
     tcost = args.tcost_bps / 10000.0
     portfolios_net = portfolios_gross.copy()
     portfolios_net = portfolios_net.merge(
@@ -713,7 +939,7 @@ def main() -> None:
         on=["date", "strategy"],
         how="left",
     )
-    # compute turnover series per strategy
+
     net_rows = []
     for strat, g in portfolios_net.groupby("strategy"):
         g = g.sort_values("date").copy()
@@ -724,12 +950,21 @@ def main() -> None:
         net_rows.append(g[["date", "strategy", "return_net"]])
     portfolios_net_long = pd.concat(net_rows, ignore_index=True).rename(columns={"return_net": "return"})
 
-    # 4) Performance tables
+
     perf_gross = performance_table(portfolios_gross, rf_annual=args.rf)
     perf_net = performance_table(portfolios_net_long, rf_annual=args.rf)
     dist_gross = strategy_return_distribution(portfolios_gross)
 
-    # 5) Selection frequency (Table 8)
+    bootstrap_tests = block_bootstrap_portfolio_tests(
+        portfolios_gross,
+        comparisons=[("GB", f"MomentumTop{args.top_k}"), ("RF", f"MomentumTop{args.top_k}"), ("HistMean", f"MomentumTop{args.top_k}"), ("GB", "SPY")],
+        rf_annual=args.rf,
+        n_boot=2000,
+        block_size=6,
+        seed=42,
+    )
+
+
     print("Computing selection frequency...")
     asset_universe = [t for t in fr.forecasts["ticker"].unique() if t != "SPY"]
     selection_rows = []
@@ -740,15 +975,15 @@ def main() -> None:
                 selection_rows.append({"model": model, "ticker": t})
     selection = pd.DataFrame(selection_rows).groupby(["ticker", "model"]).size().reset_index(name="count")
 
-    # 6) Calendar-year returns and year-end selections
+
     cal_year = calendar_year_returns(portfolios_gross)
     yr_sel = year_end_selections(fr.forecasts, top_k=args.top_k)
 
-    # 7) Descriptive stats
+
     desc_returns = descriptive_statistics(rets, rf_annual=args.rf)
     desc_targets = descriptive_statistics(pd.DataFrame({k: v["target"] for k, v in features.items()}), rf_annual=args.rf)
 
-    # Feature descriptive stats (stacked; large table)
+
     feat_desc_rows = []
     for tkr, df in features.items():
         tmp = descriptive_statistics(df.drop(columns=["target"]), rf_annual=args.rf)
@@ -756,18 +991,20 @@ def main() -> None:
         feat_desc_rows.append(tmp)
     desc_features = pd.concat(feat_desc_rows, ignore_index=True)
 
-    # 8) Save tables
+
     print("Saving tables...")
     rets.to_csv(tabdir / "monthly_returns.csv")
     fr.forecasts.to_csv(tabdir / "model_forecasts.csv", index=False)
     fr.metrics.to_csv(tabdir / "forecast_metrics.csv", index=False)
     fr.dm_tests.to_csv(tabdir / "forecast_metrics_dm.csv", index=False)
+    fr.cw_tests.to_csv(tabdir / "forecast_metrics_clark_west.csv", index=False)
     portfolios_gross.to_csv(tabdir / "portfolio_returns_gross.csv", index=False)
     portfolios_net_long.to_csv(tabdir / "portfolio_returns_net.csv", index=False)
     perf_gross.to_csv(tabdir / "portfolio_performance_gross.csv", index=False)
     perf_net.to_csv(tabdir / "portfolio_performance_net.csv", index=False)
     turnover.to_csv(tabdir / "turnover_summary.csv", index=False)
     dist_gross.to_csv(tabdir / "strategy_return_distribution.csv", index=False)
+    bootstrap_tests.to_csv(tabdir / "portfolio_bootstrap_tests.csv", index=False)
     selection.to_csv(tabdir / "selection_frequency.csv", index=False)
     yr_sel.to_csv(tabdir / "year_end_selections.csv", index=False)
     cal_year.to_csv(tabdir / "calendar_year_returns.csv", index=False)
@@ -778,7 +1015,7 @@ def main() -> None:
     if not fr.feature_importance.empty:
         fr.feature_importance.to_csv(tabdir / "feature_importance_raw.csv", index=False)
 
-    # 9) Figures
+
     print("Creating figures...")
     plot_correlation_heatmap(rets, figdir / "01_correlation_heatmap.png")
     plot_cumulative_wealth(portfolios_gross, figdir / "02_cumulative_wealth_gross.png")

@@ -1,0 +1,5 @@
+comparison,sharpe_diff,bootstrap_p_value_sharpe,median_return_diff,bootstrap_p_value_median,n_months,block_size
+GB vs MomentumTop3,-0.16151954165703997,0.4905,0.0004433627329686711,0.8795,59,6
+RF vs MomentumTop3,-0.3409233193352327,0.1285,0.001922464374242372,0.799,59,6
+HistMean vs MomentumTop3,-0.37125771438094146,0.306,0.0,1.0,59,6
+GB vs SPY,-0.1423434017271944,0.655,-0.005471592126215324,0.1945,59,6
